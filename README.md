@@ -6,4 +6,3 @@ Players are prompted to choose which upgrade they want upon loading into the sho
 ### Upgrades Per Round
 Pretty self explanatory, this is the number of upgrades that each player gets every round
 
-STILL BUG
