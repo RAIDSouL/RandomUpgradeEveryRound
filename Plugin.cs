@@ -51,7 +51,9 @@ public class Plugin : BaseUnityPlugin
         StatsUI.instance.ShowStats();
         CameraGlitch.Instance.PlayUpgrade();
 
-        int value = ++StatsManager.instance.dictionaryOfDictionaries["playerUpgradesUsed"][_steamID];
+        var dict = StatsManager.instance.dictionaryOfDictionaries["playerUpgradesUsed"];
+        int value = dict.ContainsKey(_steamID) ? ++dict[_steamID] : (dict[_steamID] = 1);
+
         if (GameManager.Multiplayer())
         {
             //Broadcast that we used an upgrade
@@ -62,80 +64,16 @@ public class Plugin : BaseUnityPlugin
     }
 }
 
-[HarmonyPatch(typeof(PlayerAvatar))]
-[HarmonyPatch("SpawnRPC")]
-public static class PlayerSpawnPatch
+public static class DictionaryExtensions
 {
-    static void Prefix(PhotonView ___photonView)
+    public static int GetOrDefault(this Dictionary<string, int> dict, string key)
     {
-        Level[] bannedLevels = [RunManager.instance.levelMainMenu, RunManager.instance.levelLobbyMenu, RunManager.instance.levelTutorial];
-        if (bannedLevels.Contains(RunManager.instance.levelCurrent)) return;
-
-        List<PlayerAvatar> _allPlayer = SemiFunc.PlayerGetList();
-        List<string> _PlayerSteamID = new List<string>();
-        for (int i = 0; i < _allPlayer.Count; i++)
-        {
-            string _playerSteamID = SemiFunc.PlayerGetSteamID(SemiFunc.PlayerAvatarGetFromPhotonID(_allPlayer[i].GetComponent<PhotonView>().ViewID));
-            Debug.Log(_playerSteamID);
-            _PlayerSteamID.Add(_playerSteamID);
-        }
-
-
-        if (GameManager.Multiplayer() && !___photonView.IsMine) return;
-
-        MenuManager.instance.PageCloseAll(); //Just in case somehow other menus were opened previously.
-        while (!PunManager.instance)
-        {
-            Debug.Log("Waiting for PUN");
-        }
-        for (int i = 0; i < _PlayerSteamID.Count; i++)
-        {
-            switch (Random.Range(0, 7))
-            {
-                case 0:
-                    Debug.Log("0");
-                    PunManager.instance.UpgradePlayerEnergy(_PlayerSteamID[i]);
-                    break;
-                case 1:
-                    Debug.Log("1");
-                    PunManager.instance.UpgradePlayerExtraJump(_PlayerSteamID[i]);
-                    break;
-                case 2:
-                    Debug.Log("2");
-                    PunManager.instance.UpgradePlayerGrabRange(_PlayerSteamID[i]);
-                    break;
-                case 3:
-                    Debug.Log("3");
-                    PunManager.instance.UpgradePlayerGrabStrength(_PlayerSteamID[i]);
-                    break;
-                case 4:
-                    Debug.Log("4");
-                    PunManager.instance.UpgradePlayerHealth(_PlayerSteamID[i]);
-                    break;
-                case 5:
-                    Debug.Log("5");
-                    PunManager.instance.UpgradePlayerSprintSpeed(_PlayerSteamID[i]);
-                    break;
-                case 6:
-                    Debug.Log("6");
-                    PunManager.instance.UpgradePlayerTumbleLaunch(_PlayerSteamID[i]);
-                    break;
-                case 7:
-                    Debug.Log("7");
-                    PunManager.instance.UpgradeMapPlayerCount(_PlayerSteamID[i]);
-                    break;
-            }
-            int value = ++StatsManager.instance.dictionaryOfDictionaries["playerUpgradesUsed"][_PlayerSteamID[i]];
-            if (GameManager.Multiplayer())
-            {
-                PhotonView _photonView = PunManager.instance.GetComponent<PhotonView>();
-                _photonView.RPC("UpdateStatRPC", RpcTarget.Others, "playerUpgradesUsed", _PlayerSteamID[i], value);
-            }
-        }
+        if (dict == null) return 0;
+        if (!dict.ContainsKey(key)) return 0;
+        return dict[key];
     }
 }
 
-//Our custom save data handling
 [HarmonyPatch(typeof(StatsManager))]
 [HarmonyPatch("Start")]
 public static class StatsManagerPatch
@@ -143,24 +81,141 @@ public static class StatsManagerPatch
     static void Prefix(StatsManager __instance)
     {
         __instance.dictionaryOfDictionaries.Add("playerUpgradesUsed", []);
+
+        // Initialize all player upgrade stat dictionaries to prevent null refs
+        __instance.playerUpgradeLaunch = new Dictionary<string, int>();
+        __instance.playerUpgradeStamina = new Dictionary<string, int>();
+        __instance.playerUpgradeExtraJump = new Dictionary<string, int>();
+        __instance.playerUpgradeRange = new Dictionary<string, int>();
+        __instance.playerUpgradeStrength = new Dictionary<string, int>();
+        __instance.playerUpgradeHealth = new Dictionary<string, int>();
+        __instance.playerUpgradeSpeed = new Dictionary<string, int>();
+        __instance.playerUpgradeMapPlayerCount = new Dictionary<string, int>();
     }
 }
 
-//Yippee networking and boilerplate!
+[HarmonyPatch(typeof(PlayerAvatar))]
+[HarmonyPatch("SpawnRPC")]
+public static class PlayerSpawnPatch
+{
+    static void Prefix(PhotonView ___photonView)
+    {
+        if (RunManager.instance.levelCurrent != SemiFunc.RunIsLevel())
+        {
+            //Plugin.Logger.LogInfo("[UpgradeEveryRound] Skipping upgrade logic — not in Shop.");
+            return;
+        }
 
-//Yippee networking and boilerplate!
+        if (!PhotonNetwork.IsMasterClient || !___photonView.IsMine)
+        {
+            //Plugin.Logger.LogInfo("[UpgradeEveryRound] Skipped upgrade logic — not master client.");
+            return;
+        }
+
+        Debug.Log("Call Coroutine");
+        CoroutineRunner.Instance.StartCoroutine(WaitForPlayersAndApplyUpgrades(___photonView));
+
+    }
+    private static System.Collections.IEnumerator WaitForPlayersAndApplyUpgrades(PhotonView ___photonView)
+    {
+        List<PlayerAvatar> players = SemiFunc.PlayerGetAll();
+        if (players == null || players.Count == 0)
+        {
+            Plugin.Logger.LogWarning("[UpgradeEveryRound] No player avatars found!");
+            yield break;
+        }
+
+        Level[] bannedLevels = [RunManager.instance.levelMainMenu, RunManager.instance.levelLobbyMenu, RunManager.instance.levelTutorial];
+        if (bannedLevels.Contains(RunManager.instance.levelCurrent)) yield break;
+
+        foreach (var avatar in players)
+        {
+            string steamID = SemiFunc.PlayerGetSteamID(avatar);
+
+            if (string.IsNullOrEmpty(steamID)) continue;
+
+            for (int i = 0; i < Plugin.upgradesPerRound.Value; i++)
+            {
+                ApplyRandomUpgrade(steamID);
+            }
+        }
+    }
+
+    public static void ApplyRandomUpgrade(string steamID)
+    {
+
+        switch (Random.Range(0, 8))
+        {
+            case 0: PunManager.instance.UpgradePlayerEnergy(steamID); break;
+            case 1: PunManager.instance.UpgradePlayerExtraJump(steamID); break;
+            case 2: PunManager.instance.UpgradePlayerGrabRange(steamID); break;
+            case 3: PunManager.instance.UpgradePlayerGrabStrength(steamID); break;
+            case 4: PunManager.instance.UpgradePlayerSprintSpeed(steamID); break;
+            case 5: PunManager.instance.UpgradePlayerHealth(steamID); break;
+            case 6:
+                try
+                {
+                    PunManager.instance.UpgradePlayerTumbleLaunch(steamID);
+                }
+                catch (System.NullReferenceException ex)
+                {
+                    Plugin.Logger.LogWarning($"Caught NullRef in TumbleLaunch for {steamID}: {ex.Message}");
+                    ApplyRandomUpgrade(steamID);
+                }
+                break;
+            case 7:
+                if (StatsManager.instance.playerUpgradeMapPlayerCount.ContainsKey(steamID) && StatsManager.instance.playerUpgradeMapPlayerCount[steamID] > 0)
+                {
+                    Plugin.Logger.LogInfo($"[UpgradeEveryRound] Rerolling upgrade for {steamID} — already has MapPlayerCount");
+                    ApplyRandomUpgrade(steamID);
+                    break;
+                }
+                else
+                {
+                    PunManager.instance.UpgradeMapPlayerCount(steamID);
+                }
+                break;
+        }
+        Plugin.ApplyUpgrade(steamID);
+    }
+}
+
+public static class PatchHelper
+{
+    public static void SendStatRPC(Dictionary<string, int> dict, string steamID, string rpcName, PhotonView photonView)
+    {
+        if (dict == null)
+        {
+            Debug.LogWarning("Stat dictionary is null");
+            return;
+        }
+        if (photonView == null)
+        {
+            Debug.LogWarning("PhotonView is null");
+            return;
+        }
+        if (string.IsNullOrEmpty(steamID))
+        {
+            Debug.LogWarning("SteamID is null or empty");
+            return;
+        }
+        if (!dict.ContainsKey(steamID))
+        {
+            Debug.LogWarning($"Stat dictionary does not contain key: {steamID}");
+            return;
+        }
+
+        Debug.Log($"Sending RPC '{rpcName}' for {steamID} with value {dict[steamID]}");
+        photonView.RPC(rpcName, RpcTarget.Others, steamID, dict[steamID]);
+    }
+}
 
 [HarmonyPatch(typeof(PunManager))]
 [HarmonyPatch(nameof(PunManager.UpgradeMapPlayerCount))]
 public static class UpgradeMapPlayerCountPatch
 {
     static void Postfix(string _steamID, PhotonView ___photonView, StatsManager ___statsManager)
-    {
-        if (!SemiFunc.IsMasterClient() && GameManager.Multiplayer())
-        {
-            ___photonView.RPC("UpgradeMapPlayerCountRPC", RpcTarget.Others, _steamID, ___statsManager.playerUpgradeMapPlayerCount[_steamID]);
-        }
-    }
+        => PatchHelper.SendStatRPC(___statsManager.playerUpgradeMapPlayerCount, _steamID, "UpgradeMapPlayerCountRPC", ___photonView);
 }
 
 [HarmonyPatch(typeof(PunManager))]
@@ -168,12 +223,7 @@ public static class UpgradeMapPlayerCountPatch
 public static class UpgradePlayerEnergyPatch
 {
     static void Postfix(string _steamID, PhotonView ___photonView, StatsManager ___statsManager)
-    {
-        if (!SemiFunc.IsMasterClient() && GameManager.Multiplayer())
-        {
-            ___photonView.RPC("UpgradePlayerEnergyCountRPC", RpcTarget.Others, _steamID, ___statsManager.playerUpgradeStamina[_steamID]);
-        }
-    }
+        => PatchHelper.SendStatRPC(___statsManager.playerUpgradeStamina, _steamID, "UpgradePlayerEnergyCountRPC", ___photonView);
 }
 
 [HarmonyPatch(typeof(PunManager))]
@@ -181,12 +231,7 @@ public static class UpgradePlayerEnergyPatch
 public static class UpgradePlayerExtraJumpPatch
 {
     static void Postfix(string _steamID, PhotonView ___photonView, StatsManager ___statsManager)
-    {
-        if (!SemiFunc.IsMasterClient() && GameManager.Multiplayer())
-        {
-            ___photonView.RPC("UpgradePlayerExtraJumpRPC", RpcTarget.Others, _steamID, ___statsManager.playerUpgradeExtraJump[_steamID]);
-        }
-    }
+        => PatchHelper.SendStatRPC(___statsManager.playerUpgradeExtraJump, _steamID, "UpgradePlayerExtraJumpRPC", ___photonView);
 }
 
 [HarmonyPatch(typeof(PunManager))]
@@ -194,12 +239,7 @@ public static class UpgradePlayerExtraJumpPatch
 public static class UpgradePlayerGrabRangePatch
 {
     static void Postfix(string _steamID, PhotonView ___photonView, StatsManager ___statsManager)
-    {
-        if (!SemiFunc.IsMasterClient() && GameManager.Multiplayer())
-        {
-            ___photonView.RPC("UpgradePlayerGrabRangeRPC", RpcTarget.Others, _steamID, ___statsManager.playerUpgradeRange[_steamID]);
-        }
-    }
+        => PatchHelper.SendStatRPC(___statsManager.playerUpgradeRange, _steamID, "UpgradePlayerGrabRangeRPC", ___photonView);
 }
 
 [HarmonyPatch(typeof(PunManager))]
@@ -207,12 +247,7 @@ public static class UpgradePlayerGrabRangePatch
 public static class UpgradePlayerGrabStrengthPatch
 {
     static void Postfix(string _steamID, PhotonView ___photonView, StatsManager ___statsManager)
-    {
-        if (!SemiFunc.IsMasterClient() && GameManager.Multiplayer())
-        {
-            ___photonView.RPC("UpgradePlayerGrabStrengthRPC", RpcTarget.Others, _steamID, ___statsManager.playerUpgradeStrength[_steamID]);
-        }
-    }
+        => PatchHelper.SendStatRPC(___statsManager.playerUpgradeStrength, _steamID, "UpgradePlayerGrabStrengthRPC", ___photonView);
 }
 
 [HarmonyPatch(typeof(PunManager))]
@@ -220,12 +255,7 @@ public static class UpgradePlayerGrabStrengthPatch
 public static class UpgradePlayerHealthPatch
 {
     static void Postfix(string playerName, PhotonView ___photonView, StatsManager ___statsManager)
-    {
-        if (!SemiFunc.IsMasterClient() && GameManager.Multiplayer())
-        {
-            ___photonView.RPC("UpgradePlayerHealthRPC", RpcTarget.Others, playerName, ___statsManager.playerUpgradeHealth[playerName]);
-        }
-    }
+        => PatchHelper.SendStatRPC(___statsManager.playerUpgradeHealth, playerName, "UpgradePlayerHealthRPC", ___photonView);
 }
 
 [HarmonyPatch(typeof(PunManager))]
@@ -233,12 +263,7 @@ public static class UpgradePlayerHealthPatch
 public static class UpgradePlayerSprintSpeedPatch
 {
     static void Postfix(string _steamID, PhotonView ___photonView, StatsManager ___statsManager)
-    {
-        if (!SemiFunc.IsMasterClient() && GameManager.Multiplayer())
-        {
-            ___photonView.RPC("UpgradePlayerSprintSpeedRPC", RpcTarget.Others, _steamID, ___statsManager.playerUpgradeSpeed[_steamID]);
-        }
-    }
+        => PatchHelper.SendStatRPC(___statsManager.playerUpgradeSpeed, _steamID, "UpgradePlayerSprintSpeedRPC", ___photonView);
 }
 
 [HarmonyPatch(typeof(PunManager))]
@@ -246,10 +271,52 @@ public static class UpgradePlayerSprintSpeedPatch
 public static class UpgradePlayerTumbleLaunchPatch
 {
     static void Postfix(string _steamID, PhotonView ___photonView, StatsManager ___statsManager)
+        => PatchHelper.SendStatRPC(___statsManager.playerUpgradeLaunch, _steamID, "UpgradePlayerTumbleLaunchRPC", ___photonView);
+}
+
+public class CoroutineRunner : MonoBehaviour
+{
+    private static CoroutineRunner _instance;
+
+    public static CoroutineRunner Instance
     {
-        if (!SemiFunc.IsMasterClient() && GameManager.Multiplayer())
+        get
         {
-            ___photonView.RPC("UpgradePlayerTumbleLaunchRPC", RpcTarget.Others, _steamID, ___statsManager.playerUpgradeLaunch[_steamID]);
+            if (_instance == null)
+            {
+                GameObject go = new GameObject("CoroutineRunner");
+                _instance = go.AddComponent<CoroutineRunner>();
+                UnityEngine.Object.DontDestroyOnLoad(go);
+            }
+            return _instance;
+        }
+    }
+    private void Update()
+    {
+        if (Input.GetKeyDown(KeyCode.F1) && PhotonNetwork.IsMasterClient)
+        {
+            Debug.Log("[UpgradeEveryRound] F1 key detected — manual upgrade triggered.");
+
+            List<PlayerAvatar> players = SemiFunc.PlayerGetAll();
+            if (players == null || players.Count == 0)
+            {
+                Plugin.Logger.LogWarning("[UpgradeEveryRound] No player avatars found!");
+                return;
+            }
+
+            Level[] bannedLevels = [RunManager.instance.levelMainMenu, RunManager.instance.levelLobbyMenu, RunManager.instance.levelTutorial];
+            if (bannedLevels.Contains(RunManager.instance.levelCurrent)) return;
+
+            foreach (var avatar in players)
+            {
+                string steamID = SemiFunc.PlayerGetSteamID(avatar);
+                if (string.IsNullOrEmpty(steamID)) continue;
+
+                for (int i = 0; i < Plugin.upgradesPerRound.Value; i++)
+                {
+                    PlayerSpawnPatch.ApplyRandomUpgrade(steamID);
+                }
+            }
         }
     }
 }
